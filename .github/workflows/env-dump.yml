@@ -1,0 +1,22 @@
+name: Env Dump (proves ACTIONS_RUNTIME_TOKEN is available in fork PR runs)
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read   # explicitly minimal — proving these vars don't depend on permissions
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show ACTIONS_* env vars (without leaking the actual token)
+        run: |
+          echo "=== Env vars whose names start with ACTIONS_ ==="
+          env | grep -E '^ACTIONS_' | awk -F= '{print $1 "=" substr($2,1,20) "..."}'
+          echo ""
+          echo "=== ACTIONS_RUNTIME_TOKEN length ==="
+          echo "${#ACTIONS_RUNTIME_TOKEN} characters"
+          echo ""
+          echo "=== ACTIONS_RESULTS_URL ==="
+          echo "$ACTIONS_RESULTS_URL"
