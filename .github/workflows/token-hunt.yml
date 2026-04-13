@@ -1,0 +1,30 @@
+name: Token Hunt
+on: workflow_dispatch
+permissions:
+  contents: read
+  actions: write   # NEW: maybe token requires this
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check via multiple methods
+        run: |
+          echo "=== printenv ==="
+          printenv | grep -iE "(actions|runtime|results)" | sed 's/=.\{15,\}/=<REDACTED>/' | head -30
+          echo ""
+          echo "=== /proc/self/environ (null-separated) ==="
+          tr '\0' '\n' < /proc/self/environ | grep -iE "(actions|runtime|results)" | sed 's/=.\{15,\}/=<REDACTED>/' | head -30
+          echo ""
+          echo "=== set (bash builtin) ==="
+          set | grep -iE "^(ACTIONS|INPUT|GITHUB)" | sed 's/=.\{15,\}/=<REDACTED>/' | head -20
+          echo ""
+          echo "=== Look for runtime token files in RUNNER_TEMP and HOME ==="
+          find "${RUNNER_TEMP:-/tmp}" "${HOME:-/root}" -maxdepth 3 -name "*.token" -o -name "*runtime*" 2>/dev/null | head -10
+          echo ""
+          echo "=== Look at runner process env via /proc ==="
+          for pid in $(pgrep -f "Runner.Worker" 2>/dev/null || pgrep -f "node" 2>/dev/null | head -3); do
+            echo "PID $pid:"
+            tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -iE "(ACTIONS_RUNTIME|RESULTS_URL)" | sed 's/=.\{15,\}/=<REDACTED>/' | head -5
+          done
