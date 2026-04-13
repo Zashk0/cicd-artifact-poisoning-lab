@@ -1,0 +1,126 @@
+name: Build Nightlies (VICTIM PATTERN)
+# This replicates cosmos-sdk's build-simd-nightlies.yml vulnerable pattern.
+# DO NOT use this in production — it is intentionally vulnerable for testing.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-nightlies
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build a fake "binary" (just a shell script for the lab)
+        run: |
+          mkdir -p dist
+          cat > dist/myapp-linux-amd64 <<'EOF'
+          #!/bin/bash
+          echo "[LEGIT BINARY] Running normally - $(date)"
+          exit 0
+          EOF
+          chmod +x dist/myapp-linux-amd64
+          tar -C dist -czf dist/myapp-linux-amd64.tar.gz myapp-linux-amd64
+          sha256sum dist/myapp-linux-amd64.tar.gz > dist/myapp-linux-amd64.tar.gz.sha256
+          cat dist/myapp-linux-amd64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: myapp-linux-amd64
+          path: dist/*
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y jq unzip
+
+      - name: Determine channel
+        id: channel
+        run: bash .github/nightlies/determine-channel.sh
+
+      - name: Download fresh artifacts (same-run)
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # ↓ THE VULNERABLE STEP — exactly mirrors cosmos-sdk
+      - name: Download existing Pages content
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p existing
+
+          artifact_url=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=github-pages&per_page=100" \
+            --jq '.artifacts
+              | map(select(.expired == false))
+              | sort_by(.created_at)
+              | reverse
+              | .[0].archive_download_url // ""')
+
+          if [ -z "$artifact_url" ]; then
+            echo "No existing Pages artifact found"
+            exit 0
+          fi
+
+          echo "[VICTIM] Downloading artifact from: $artifact_url"
+
+          tmp_zip=$(mktemp /tmp/github-pages-XXXXXX.zip)
+          curl -fLsS \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "$artifact_url" \
+              -o "$tmp_zip"
+
+          unzip -q "$tmp_zip" -d existing
+          rm -f "$tmp_zip"
+
+          if [ -f existing/artifact.tar ]; then
+            tar -xf existing/artifact.tar -C existing
+            rm -f existing/artifact.tar
+          fi
+
+          echo "[VICTIM] Files in existing/:"
+          find existing -type f | head -20
+
+      - name: Build site
+        run: |
+          bash .github/nightlies/build-site.sh \
+            "${{ steps.channel.outputs.channel }}" \
+            "${{ steps.channel.outputs.is_main }}"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+          retention-days: 7
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

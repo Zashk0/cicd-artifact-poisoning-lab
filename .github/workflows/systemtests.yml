@@ -1,0 +1,25 @@
+name: System Tests (DOWNSTREAM CONSUMER)
+# Replicates cosmos-sdk's systemtests.yml that downloads + executes the nightly binary
+# Triggered on every PR — this is where the RCE lands.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-system:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run system tests (downloads + executes nightly binary)
+        run: bash scripts/build-and-run.sh
+
+      - name: Show evidence of execution
+        if: always()
+        run: |
+          echo "=== Output captured ==="
+          cat /tmp/binary-output.log 2>/dev/null || echo "no output"
